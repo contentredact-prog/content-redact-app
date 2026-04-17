@@ -17,6 +17,8 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
+import os
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
 
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TCOP, TXXX, TCOM
@@ -53,7 +55,7 @@ def get_all_works() -> list:
 # ============================================================
 # AI PIPELINE FUNCTIONS
 # ============================================================
-GOOGLE_API_KEY = "AQ.Ab8RN6JalfUnb3pRvBnTuhSyJJKNQBOMI6ao2A3tp9dC3BaTeA" 
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") 
 
 ai_client = None
 if GOOGLE_API_KEY:
