@@ -59,11 +59,19 @@ export default function UploadPage() {
       const { data: { session } } = await supabase.auth.getSession();
       const owner = session?.user?.email || "Unknown";
 
+      // 1. Send to your live Render backend
       const result = await uploadFile(file, owner);
       setWorkId(result.work_id);
-      setState("processing");
 
-      // Poll Supabase for status updates
+      // 2. THE FAST PATH CHECK! 
+      // If the new async backend instantly returns "protected", we are done!
+      if (result.status === "protected") {
+        setState("done");
+        return;
+      }
+
+      // 3. Fallback (Only runs if status is still 'processing')
+      setState("processing");
       let attempts = 0;
       const poll = setInterval(async () => {
         attempts++;
@@ -80,7 +88,7 @@ export default function UploadPage() {
         } catch { /* keep polling */ }
         if (attempts > 120) {
           clearInterval(poll);
-          setState("done"); // Optimistic — check dashboard
+          setState("done");
         }
       }, 5000);
     } catch (e: any) {
