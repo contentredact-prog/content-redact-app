@@ -1,21 +1,22 @@
 """
-Content Redact — Backend API v3.0
+Content Redact — Backend API v4.0
 ==================================
-Writes all data to Supabase Postgres. Processes uploads locally,
-extracts proofs (hash, fingerprint, transcript), scans for theft,
-then DELETES the original files. No file storage costs.
+ASYNC ARCHITECTURE:
+  Fast path (< 3 seconds):  Upload → Hash → Fingerprint → Save to Supabase Storage → Return "protected"
+  Background path (0-48 hrs): Download from Storage → Transcribe → Scan → Update DB
+  Cleanup (auto):            pg_cron deletes files from Storage after 48 hours, fingerprints stay forever
 
 Run:  uvicorn main:app --reload --port 8000
 
 Env vars:
-  SUPABASE_URL         — https://dkppcuotnphzjcmncnjg.supabase.co
-  SUPABASE_SERVICE_KEY  — service_role key (NOT anon — needed for server-side writes)
-  GOOGLE_API_KEY       — Gemini for transcription
-  APIFY_API_TOKEN      — Apify for TikTok sweeps
-  LIVE_SCANNING        — "true" to enable scheduled scans
+  SUPABASE_URL          — https://dkppcuotnphzjcmncnjg.supabase.co
+  SUPABASE_SERVICE_KEY  — service_role key
+  GOOGLE_API_KEY        — Gemini for transcription
+  APIFY_API_TOKEN       — Apify for TikTok sweeps
+  LIVE_SCANNING         — "true" to enable scheduled scans
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -41,9 +42,6 @@ from supabase import create_client, Client
 # ============================================================
 # CONFIG
 # ============================================================
-UPLOAD_DIR = Path("./uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
 BACKEND_DIR = Path(__file__).parent
 FPCALC_BIN = str(BACKEND_DIR / "fpcalc.exe") if platform.system() == "Windows" else "fpcalc"
 
@@ -52,6 +50,8 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 APIFY_TOKEN = os.environ.get("APIFY_API_TOKEN")
 LIVE_SCANNING = os.environ.get("LIVE_SCANNING", "false").lower() == "true"
+
+STORAGE_BUCKET = "media-uploads"
 
 # ============================================================
 # CLIENTS
@@ -73,7 +73,7 @@ if APIFY_TOKEN:
     print("[Init] Apify ready")
 
 # ============================================================
-# DATABASE HELPERS (Supabase)
+# DATABASE HELPERS
 # ============================================================
 def db_create_work(work: dict):
     sb.table("protected_works").insert({
@@ -82,8 +82,11 @@ def db_create_work(work: dict):
         "title": work["title"],
         "media_type": work.get("media_type"),
         "owner_name": work.get("owner", "Unknown"),
-        "processing_status": "processing",
-        "original_storage_path": "",  # We don't store files
+        "original_hash": work.get("original_hash"),
+        "processing_status": "protected",
+        "processing_stage": "fingerprinted",
+        "storage_path": work.get("storage_path"),
+        "original_storage_path": "",
     }).execute()
 
 
@@ -96,8 +99,15 @@ def db_get_work(work_id: str) -> Optional[dict]:
     return res.data
 
 
-def db_get_all_protected() -> list:
-    res = sb.table("protected_works").select("*").eq("processing_status", "protected").execute()
+def db_get_works_needing_processing() -> list:
+    """Get works that are fingerprinted but not yet transcribed/scanned."""
+    res = sb.table("protected_works").select("*").eq("processing_stage", "fingerprinted").not_.is_("storage_path", "null").execute()
+    return res.data or []
+
+
+def db_get_all_monitoring() -> list:
+    """Get works in monitoring stage for scheduled re-scans."""
+    res = sb.table("protected_works").select("*").eq("processing_stage", "monitoring").execute()
     return res.data or []
 
 
@@ -110,10 +120,9 @@ def db_save_fingerprint(work_id: str, fp_type: str, fp_data: str):
 
 
 def db_save_match(work_id: str, platform: str, url: str, description: str = "", confidence: int = 50):
-    # Check for duplicate URL first
     existing = sb.table("discovered_matches").select("id").eq("work_id", work_id).eq("match_url", url).execute()
     if existing.data:
-        return  # Already exists
+        return
     sb.table("discovered_matches").insert({
         "work_id": work_id,
         "platform": platform,
@@ -124,18 +133,90 @@ def db_save_match(work_id: str, platform: str, url: str, description: str = "", 
     }).execute()
 
 
-def db_get_matches(work_id: str) -> list:
-    res = sb.table("discovered_matches").select("*").eq("work_id", work_id).execute()
-    return res.data or []
-
-
 def db_get_user_by_email(email: str) -> Optional[dict]:
     res = sb.table("users").select("*").eq("email", email).maybe_single().execute()
     return res.data
 
 
 # ============================================================
-# AI TRANSCRIPTION
+# SUPABASE STORAGE HELPERS
+# ============================================================
+def upload_to_storage(local_path: str, storage_path: str) -> bool:
+    """Upload a file to Supabase Storage bucket."""
+    try:
+        with open(local_path, "rb") as f:
+            sb.storage.from_(STORAGE_BUCKET).upload(storage_path, f)
+        print(f"[Storage] Uploaded: {storage_path}")
+        return True
+    except Exception as e:
+        print(f"[Storage] Upload failed: {e}")
+        return False
+
+
+def download_from_storage(storage_path: str, local_path: str) -> bool:
+    """Download a file from Supabase Storage to local temp."""
+    try:
+        data = sb.storage.from_(STORAGE_BUCKET).download(storage_path)
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"[Storage] Downloaded: {storage_path}")
+        return True
+    except Exception as e:
+        print(f"[Storage] Download failed: {e}")
+        return False
+
+
+def delete_from_storage(storage_path: str):
+    """Delete a file from Supabase Storage."""
+    try:
+        sb.storage.from_(STORAGE_BUCKET).remove([storage_path])
+        print(f"[Storage] Deleted: {storage_path}")
+    except Exception as e:
+        print(f"[Storage] Delete failed: {e}")
+
+
+# ============================================================
+# FAST PATH: FINGERPRINTING (< 3 seconds)
+# ============================================================
+def sha256_of_file(filepath: str) -> str:
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_audio_fingerprint(filepath: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            [FPCALC_BIN, "-json", filepath],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout).get("fingerprint")
+    except Exception as e:
+        print(f"[FP] {e}")
+    return None
+
+
+def get_video_fingerprint(filepath: str) -> Optional[str]:
+    try:
+        thumb = filepath + ".thumb.jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", filepath, "-ss", "5", "-frames:v", "1", thumb],
+            capture_output=True, timeout=30
+        )
+        if os.path.exists(thumb):
+            h = sha256_of_file(thumb)
+            os.remove(thumb)
+            return h
+    except Exception as e:
+        print(f"[Video FP] {e}")
+    return None
+
+
+# ============================================================
+# BACKGROUND PATH: TRANSCRIPTION + SCANNING
 # ============================================================
 def transcribe_media(filepath: str) -> Optional[str]:
     if not ai_client:
@@ -154,17 +235,12 @@ def transcribe_media(filepath: str) -> Optional[str]:
             model="gemini-2.5-flash",
             contents=[media_file, "Transcribe the audio verbatim. Return only the transcript."]
         )
-        transcript = response.text.strip()
-        print(f"[AI] Transcript: {len(transcript)} chars")
-        return transcript
+        return response.text.strip()
     except Exception as e:
         print(f"[AI] Error: {e}")
         return None
 
 
-# ============================================================
-# TIKTOK SCANNING
-# ============================================================
 def extract_anchor_phrases(transcript: str) -> list[str]:
     words = transcript.split()
     total = len(words)
@@ -184,7 +260,6 @@ def sweep_tiktok(anchor_phrase: str) -> list[dict]:
     if not apify_client:
         return []
     try:
-        print(f"[TikTok] Sweeping: '{anchor_phrase[:50]}...'")
         run = apify_client.actor("clockworks/tiktok-scraper").call(
             run_input={"searchQueries": [anchor_phrase], "resultsPerPage": 10}
         )
@@ -192,11 +267,7 @@ def sweep_tiktok(anchor_phrase: str) -> list[dict]:
         for item in apify_client.dataset(run["defaultDatasetId"]).iterate_items():
             url = item.get("webVideoUrl")
             if url:
-                suspects.append({
-                    "url": url,
-                    "description": (item.get("text") or "")[:300],
-                })
-        print(f"[TikTok] {len(suspects)} suspects")
+                suspects.append({"url": url, "description": (item.get("text") or "")[:300]})
         return suspects
     except Exception as e:
         print(f"[TikTok] Error: {e}")
@@ -214,143 +285,60 @@ def scan_for_matches(work_id: str, transcript: str) -> int:
     return count
 
 
-# ============================================================
-# PROTECTION UTILITIES
-# ============================================================
-def sha256_of_file(filepath: str) -> str:
-    h = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def get_audio_fingerprint(filepath: str) -> Optional[str]:
-    try:
-        result = subprocess.run(
-            [FPCALC_BIN, "-json", filepath],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode == 0:
-            return json.loads(result.stdout).get("fingerprint")
-    except Exception as e:
-        print(f"[FP] {e}")
-    return None
-
-
-def get_video_fingerprint(filepath: str) -> Optional[str]:
-    try:
-        thumb = filepath + ".thumb.jpg"
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", filepath, "-ss", "5", "-frames:v", "1", thumb],
-            capture_output=True, timeout=60
-        )
-        if os.path.exists(thumb):
-            h = sha256_of_file(thumb)
-            os.remove(thumb)
-            return h
-    except Exception as e:
-        print(f"[Video FP] {e}")
-    return None
-
-
-def embed_audio_metadata(filepath: str, work_id: str, owner: str) -> bool:
-    try:
-        ext = Path(filepath).suffix.lower()
-        handler = MP3(filepath) if ext == ".mp3" else WAVE(filepath) if ext == ".wav" else None
-        if not handler:
-            return False
-        if handler.tags is None:
-            handler.add_tags()
-        handler.tags.add(TCOP(encoding=3, text=[f"\u00a9 {owner}"]))
-        handler.tags.add(TXXX(encoding=3, desc="ContentRedact-WorkID", text=[work_id]))
-        handler.tags.add(TXXX(encoding=3, desc="ContentRedact-Timestamp",
-                               text=[datetime.now(timezone.utc).isoformat()]))
-        handler.save()
-        return True
-    except Exception as e:
-        print(f"[Meta] {e}")
-        return False
-
-
-def embed_video_metadata(input_path: str, output_path: str, work_id: str, owner: str) -> bool:
-    try:
-        result = subprocess.run([
-            "ffmpeg", "-y", "-i", input_path,
-            "-metadata", f"copyright=\u00a9 {owner}",
-            "-metadata", f"comment=ContentRedact-WorkID:{work_id}",
-            "-codec", "copy", output_path
-        ], capture_output=True, timeout=300)
-        return result.returncode == 0
-    except Exception as e:
-        print(f"[Video Meta] {e}")
-        return False
-
-
-# ============================================================
-# MAIN PIPELINE
-# ============================================================
-def process_and_protect(work_id: str, file_path: str, media_type: str, owner: str):
-    print(f"\n{'='*50}")
-    print(f"[Pipeline] Processing {work_id} ({media_type})")
-    print(f"{'='*50}")
+def background_transcribe_and_scan(work_id: str, storage_path: str):
+    """
+    Background worker: downloads file from Supabase Storage,
+    transcribes it, scans for matches, then cleans up.
+    Runs silently — user already has their "protected" status.
+    """
+    temp_path = f"/tmp/{work_id}{Path(storage_path).suffix}"
 
     try:
-        # 1. Hash
-        file_hash = sha256_of_file(file_path)
-        print(f"[Pipeline] SHA-256: {file_hash[:20]}...")
+        # 1. Download from storage
+        if not download_from_storage(storage_path, temp_path):
+            db_update_work(work_id, {"processing_stage": "failed"})
+            return
 
-        # 2. Fingerprint
-        if media_type == "audio":
-            fp = get_audio_fingerprint(file_path)
-            if fp:
-                db_save_fingerprint(work_id, "chromaprint", fp)
-                print("[Pipeline] Audio fingerprint saved")
-        else:
-            fp = get_video_fingerprint(file_path)
-            if fp:
-                db_save_fingerprint(work_id, "phash", fp)
-                print("[Pipeline] Video fingerprint saved")
+        # 2. Transcribe
+        db_update_work(work_id, {"processing_stage": "transcribing"})
+        print(f"[Background] Transcribing {work_id}...")
+        transcript = transcribe_media(temp_path)
 
-        # 3. Transcribe
-        transcript = transcribe_media(file_path)
-
-        # 4. Scan for theft
-        match_count = 0
         if transcript:
-            match_count = scan_for_matches(work_id, transcript)
-            print(f"[Pipeline] {match_count} matches found")
+            db_update_work(work_id, {"transcript": transcript})
+            print(f"[Background] Transcript: {len(transcript)} chars")
 
-        # 5. Update work record in Supabase
+            # 3. Scan
+            db_update_work(work_id, {"processing_stage": "scanning"})
+            print(f"[Background] Scanning {work_id}...")
+            match_count = scan_for_matches(work_id, transcript)
+            print(f"[Background] {match_count} matches found")
+
+        # 4. Done — move to monitoring stage
         db_update_work(work_id, {
-            "original_hash": file_hash,
-            "transcript": transcript,
-            "processing_status": "protected",
+            "processing_stage": "monitoring",
             "protected_at": datetime.now(timezone.utc).isoformat(),
         })
-
-        print(f"[Pipeline] Complete!")
+        print(f"[Background] {work_id} → monitoring")
 
     except Exception as e:
-        db_update_work(work_id, {"processing_status": "failed"})
-        print(f"[Pipeline] ERROR: {e}")
+        db_update_work(work_id, {"processing_stage": "failed"})
+        print(f"[Background] ERROR: {e}")
 
-    # 6. Delete all local files — only Supabase data remains
-    for f in UPLOAD_DIR.glob(f"{work_id}*"):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-    print(f"[Pipeline] Local files cleaned up")
-    print(f"{'='*50}\n")
+    finally:
+        # Always clean up the local temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            print(f"[Background] Temp file cleaned: {temp_path}")
 
 
 # ============================================================
-# SCHEDULED SCANNER
+# SCHEDULED RE-SCANS
 # ============================================================
 def run_scheduled_scans():
+    """Re-scan all works in monitoring stage for new matches."""
     print("\n[Scheduler] Starting periodic scan...")
-    works = db_get_all_protected()
+    works = db_get_all_monitoring()
     scanned = 0
     for work in works:
         transcript = work.get("transcript")
@@ -366,14 +354,53 @@ def run_scheduled_scans():
     print(f"[Scheduler] Done — {scanned} works (live={LIVE_SCANNING})\n")
 
 
+def process_pending_works():
+    """Pick up any works that were fingerprinted but haven't been transcribed yet."""
+    works = db_get_works_needing_processing()
+    if not works:
+        return
+    print(f"\n[Worker] Found {len(works)} works needing background processing...")
+    for work in works:
+        storage_path = work.get("storage_path")
+        if storage_path:
+            background_transcribe_and_scan(work["id"], storage_path)
+
+
+# ============================================================
+# STORAGE CLEANUP
+# ============================================================
+def cleanup_expired_files():
+    """Delete files from Supabase Storage that are older than 48 hours."""
+    print("\n[Cleanup] Checking for expired files...")
+    res = sb.table("protected_works").select("id, storage_path, created_at").not_.is_("storage_path", "null").execute()
+
+    cleaned = 0
+    for work in (res.data or []):
+        created = datetime.fromisoformat(work["created_at"].replace("Z", "+00:00"))
+        age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+
+        if age_hours > 48:
+            delete_from_storage(work["storage_path"])
+            db_update_work(work["id"], {"storage_path": None})
+            cleaned += 1
+
+    print(f"[Cleanup] Deleted {cleaned} expired files\n")
+
+
 # ============================================================
 # LIFECYCLE
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_scheduled_scans, "interval", minutes=30)
+    # Process pending works every 5 minutes
+    scheduler.add_job(process_pending_works, "interval", minutes=5, id="process_pending")
+    # Re-scan monitored works every 30 minutes
+    scheduler.add_job(run_scheduled_scans, "interval", minutes=30, id="scheduled_scan")
+    # Clean up expired storage files every hour
+    scheduler.add_job(cleanup_expired_files, "interval", hours=1, id="storage_cleanup")
     scheduler.start()
+    print("[Init] Schedulers started: pending(5m), scan(30m), cleanup(1h)")
     yield
     scheduler.shutdown()
 
@@ -381,45 +408,102 @@ async def lifespan(app: FastAPI):
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="Content Redact API", version="3.0", lifespan=lifespan)
+app = FastAPI(title="Content Redact API", version="4.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/")
 def health():
-    return {"app": "Content Redact API", "version": "3.0", "ai": ai_client is not None, "scanning": apify_client is not None}
+    return {
+        "app": "Content Redact API",
+        "version": "4.0",
+        "architecture": "async (fast fingerprint + background scan)",
+        "ai": ai_client is not None,
+        "scanning": apify_client is not None,
+    }
 
 
 @app.post("/api/v1/works/protect")
 async def protect_new_work(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    owner: str = "Default Owner",
+    owner: str = Form("Default Owner"),
 ):
+    """
+    FAST PATH — completes in ~3 seconds:
+      1. Save to temp
+      2. Hash + Fingerprint (instant math)
+      3. Upload to Supabase Storage (48-hour holding tank)
+      4. Save work record as "protected"
+      5. Hand off transcription/scanning to background worker
+      6. Delete local temp file
+      7. Return immediately
+    """
     allowed = {"video/mp4": "video", "audio/mpeg": "audio", "audio/wav": "audio", "audio/x-wav": "audio", "audio/mp3": "audio"}
     media_type = allowed.get(file.content_type)
     if not media_type:
         raise HTTPException(400, f"Unsupported: {file.content_type}")
 
     work_id = str(uuid.uuid4())
-    file_path = str(UPLOAD_DIR / f"{work_id}{Path(file.filename).suffix}")
-    with open(file_path, "wb") as buf:
+    file_ext = Path(file.filename).suffix
+    temp_path = f"/tmp/{work_id}{file_ext}"
+
+    # 1. Save to temp
+    with open(temp_path, "wb") as buf:
         shutil.copyfileobj(file.file, buf)
 
-    # Look up user by email to link the work
-    user = db_get_user_by_email(owner)
-    user_id = user["id"] if user else None
+    try:
+        # 2. FAST MATH — Hash + Fingerprint (< 2 seconds)
+        file_hash = sha256_of_file(temp_path)
 
-    db_create_work({
-        "id": work_id,
-        "user_id": user_id,
-        "title": file.filename,
-        "media_type": media_type,
-        "owner": owner,
-    })
+        if media_type == "audio":
+            fp = get_audio_fingerprint(temp_path)
+            fp_type = "chromaprint"
+        else:
+            fp = get_video_fingerprint(temp_path)
+            fp_type = "phash"
 
-    background_tasks.add_task(process_and_protect, work_id, file_path, media_type, owner)
-    return {"message": "Upload received.", "work_id": work_id, "status": "processing"}
+        # 3. Upload to Supabase Storage (holding tank)
+        # Organize by user email folder for RLS
+        user = db_get_user_by_email(owner)
+        user_id = user["id"] if user else "anonymous"
+        storage_path = f"{user_id}/{work_id}{file_ext}"
+
+        upload_to_storage(temp_path, storage_path)
+
+        # 4. Save work record — status is ALREADY "protected"
+        db_create_work({
+            "id": work_id,
+            "user_id": user["id"] if user else None,
+            "title": file.filename,
+            "media_type": media_type,
+            "owner": owner,
+            "original_hash": file_hash,
+            "storage_path": storage_path,
+        })
+
+        # Save fingerprint
+        if fp:
+            db_save_fingerprint(work_id, fp_type, fp)
+
+        # 5. Hand off to background worker
+        background_tasks.add_task(background_transcribe_and_scan, work_id, storage_path)
+
+        # 6. Delete local temp file immediately
+        os.remove(temp_path)
+
+        # 7. Return instantly — user sees "protected" in ~3 seconds
+        return {
+            "work_id": work_id,
+            "status": "protected",
+            "message": "Your content is fingerprinted and protected. Background scan in progress.",
+        }
+
+    except Exception as e:
+        # Clean up on failure
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(500, f"Protection failed: {str(e)}")
 
 
 @app.post("/api/v1/works/{work_id}/scan")
@@ -428,7 +512,7 @@ async def trigger_scan(work_id: str, background_tasks: BackgroundTasks):
     if not work:
         raise HTTPException(404, "Work not found")
     if not work.get("transcript"):
-        raise HTTPException(400, "No transcript available")
+        raise HTTPException(400, "Transcript not ready yet — background processing still in progress")
 
     def do_scan():
         scan_for_matches(work_id, work["transcript"])
@@ -503,6 +587,7 @@ async def get_certificate(work_id: str):
         "sha256": work.get("original_hash"),
         "fingerprints": [{"type": f["fingerprint_type"], "data": f["fingerprint_data"][:40] + "..."} for f in (fps.data or [])],
         "transcript_excerpt": (work.get("transcript") or "")[:200],
+        "processing_stage": work.get("processing_stage"),
         "protected_at": work.get("protected_at"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
