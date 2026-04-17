@@ -1,0 +1,10 @@
+node_modules/
+.next/
+uploads/
+protected/
+content_redact.db
+__pycache__/
+*.mp4
+*.mp3
+*.wav
+*.jpg
