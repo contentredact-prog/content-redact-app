@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Optional
 import os
+from apify_client import ApifyClient
 gemini_api_key = os.environ.get("GEMINI_API_KEY")
 
 from mutagen.mp3 import MP3
@@ -30,6 +31,52 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # DATABASE SETUP (PERMANENT STORAGE)
 # ============================================================
 DB_FILE = "content_redact.db"
+
+
+
+# 1. Securely load your Apify token from the environment
+apify_token = os.environ.get("APIFY_API_TOKEN")
+client = ApifyClient(apify_token)
+
+def sweep_tiktok(anchor_phrase):
+    print(f"🕵️ Initiating TikTok sweep for script phrase: '{anchor_phrase}'")
+    
+    # 2. Configure the search instructions for the Apify Actor
+    # We are using a popular, reliable TikTok scraper actor
+    run_input = {
+        "searchQueries": [anchor_phrase],
+        "resultsPerPage": 10,
+    }
+    
+    print("Launching Apify Scraper... (This usually takes 30-60 seconds)")
+    
+    # 3. Fire the scraper and wait for it to finish returning data
+    run = client.actor("clockworks/tiktok-scraper").call(run_input=run_input)
+    
+    # 4. Gather the stolen suspects
+    print("Sweep complete. Analyzing pulled data...")
+    suspect_videos = []
+    
+    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        # Grab the URL and whatever text/captions the thief posted with it
+        video_url = item.get("webVideoUrl")
+        video_text = item.get("text", "")
+        
+        if video_url:
+            suspect_videos.append({
+                "url": video_url, 
+                "text": video_text
+            })
+            print(f"🚨 Suspect Found: {video_url}")
+            
+    return suspect_videos
+
+# --- Quick Local Test ---
+# If you run this file directly, it will test the sweep with a sample phrase
+if __name__ == "__main__":
+    sample_stolen_quote = "This is the exact script I wrote for my video"
+    results = sweep_tiktok(sample_stolen_quote)
+    print(f"Total suspects gathered: {len(results)}")
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -85,21 +132,31 @@ def transcribe_media_with_ai(filepath: str) -> str:
         return "Transcription failed."
 
 def scan_web_for_shares(transcript: str) -> list:
-    if not ai_client or "failed" in transcript.lower() or len(transcript) < 10: return []
+    if not transcript or "failed" in transcript.lower() or len(transcript) < 10: 
+        return []
+        
     try:
-        print("[AI] Scanning the web for unauthorized shares...")
-        prompt = f"Search the internet and tell me if this specific text appears anywhere online: '{transcript[:500]}'. Return a JSON array of URLs where you found it."
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        # Using mock data to simulate new findings
-        return [
-            {"platform": "YouTube", "url": "https://youtube.com/watch?v=AI_Found123", "action_status": "pending"},
-            {"platform": "TikTok", "url": "https://tiktok.com/@user/video/AI_Found456", "action_status": "pending"}
-        ]
+        print("\n[Scanner] Extracting anchor phrase for the hunt...")
+        # Grab the first 15 words of the AI transcript to use as our unique fingerprint
+        words = transcript.split()
+        anchor_phrase = " ".join(words[:15]) 
+        
+        # Fire the Apify TikTok Sweeper using the extracted phrase!
+        suspect_videos = sweep_tiktok(anchor_phrase)
+        
+        # Format the results so the frontend dashboard can read them perfectly
+        formatted_matches = []
+        for suspect in suspect_videos:
+            formatted_matches.append({
+                "platform": "TikTok", 
+                "url": suspect["url"], 
+                "action_status": "pending"
+            })
+            
+        return formatted_matches
+        
     except Exception as e:
-        print(f"[AI Scanning Error] {e}")
+        print(f"[Scanning Error] {e}")
         return []
 
 # ============================================================

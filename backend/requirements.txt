@@ -4,3 +4,4 @@ python-multipart
 mutagen
 google-genai
 apscheduler
+apify-client==1.6.4
