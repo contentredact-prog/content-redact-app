@@ -1,42 +1,49 @@
-'use client'
+"use client";
 
-import { supabase } from '../lib/supabase'
+import { supabase } from "@/lib/supabase";
 
 export default function Login() {
-  
   const handleGoogleLogin = async () => {
     const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
+      provider: "google",
       options: {
-        // This ensures they are sent back to your dashboard after approving
-        redirectTo: `${window.location.origin}/dashboard`
-      }
-    })
-    if (error) console.error('Google login error:', error.message)
-  }
+        redirectTo: `${window.location.origin}/dashboard`,
+      },
+    });
+    if (error) console.error("Google login error:", error.message);
+  };
 
   const handleAppleLogin = async () => {
     const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'apple',
+      provider: "apple",
       options: {
-        redirectTo: `${window.location.origin}/dashboard`
-      }
-    })
-    if (error) console.error('Apple login error:', error.message)
-  }
+        redirectTo: `${window.location.origin}/dashboard`,
+      },
+    });
+    if (error) console.error("Apple login error:", error.message);
+  };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50">
-      <div className="max-w-md w-full p-8 bg-white rounded-lg shadow-md border border-gray-100">
-        <h2 className="text-2xl font-bold text-center text-gray-900 mb-8">
-          Welcome to Content Redact
-        </h2>
-        
-        <div className="space-y-4">
-          {/* Google Button */}
-          <button 
+    <main className="min-h-screen flex items-center justify-center bg-black px-6">
+      <div className="w-full max-w-sm">
+        {/* Logo + heading */}
+        <div className="text-center mb-10">
+          <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-gradient-to-br from-red-600 to-red-900 text-white text-lg font-black tracking-tight mb-5">
+            CR
+          </div>
+          <h1 className="text-2xl font-bold text-white tracking-tight mb-2">
+            Welcome back
+          </h1>
+          <p className="text-sm text-white/30">
+            Sign in to protect your content
+          </p>
+        </div>
+
+        {/* Auth buttons */}
+        <div className="space-y-3">
+          <button
             onClick={handleGoogleLogin}
-            className="w-full flex items-center justify-center gap-3 px-4 py-3 border border-gray-300 rounded-md bg-white text-gray-700 hover:bg-gray-50 transition-colors font-medium"
+            className="w-full flex items-center justify-center gap-3 px-4 py-3.5 rounded-lg bg-white text-black font-semibold text-[14px] hover:bg-white/90 transition-all cursor-pointer"
           >
             <svg className="w-5 h-5" viewBox="0 0 24 24">
               <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.58c2.08-1.92 3.27-4.74 3.27-8.09z" />
@@ -47,10 +54,9 @@ export default function Login() {
             Continue with Google
           </button>
 
-          {/* Apple Button */}
-          <button 
+          <button
             onClick={handleAppleLogin}
-            className="w-full flex items-center justify-center gap-3 px-4 py-3 border border-gray-300 rounded-md bg-black text-white hover:bg-gray-800 transition-colors font-medium"
+            className="w-full flex items-center justify-center gap-3 px-4 py-3.5 rounded-lg bg-white/[0.06] border border-white/[0.08] text-white font-semibold text-[14px] hover:bg-white/[0.1] transition-all cursor-pointer"
           >
             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.04 2.26-.79 3.59-.76 1.03.04 2.45.39 3.32 1.66-2.91 1.76-2.4 5.36.43 6.46-1.12 2.76-2.42 4.81-4.42 4.81zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
@@ -58,7 +64,13 @@ export default function Login() {
             Continue with Apple
           </button>
         </div>
+
+        {/* Footer note */}
+        <p className="text-center text-[11px] text-white/15 mt-8 leading-relaxed">
+          By continuing, you agree to Content Redact&apos;s<br />
+          Terms of Service and Privacy Policy
+        </p>
       </div>
-    </div>
-  )
+    </main>
+  );
 }

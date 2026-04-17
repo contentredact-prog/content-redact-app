@@ -1,210 +1,356 @@
-'use client';
+"use client";
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import { supabase } from "@/lib/supabase";
+import {
+  listWorks, getMatches, triggerScan, generateDMCA,
+  deleteWork, updateMatchStatus, certificateUrl,
+  type Work, type Match,
+} from "@/lib/api";
+import Link from "next/link";
 
-interface Match {
-  url: string;
-  platform: string;
-  action_status: string;
+// ── Status Badge ──
+function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, string> = {
+    protected: "bg-green-950/60 text-green-400 border-green-900/50",
+    processing: "bg-amber-950/60 text-amber-400 border-amber-900/50",
+    pending: "bg-white/5 text-white/40 border-white/10",
+    failed: "bg-red-950/60 text-red-400 border-red-900/50",
+  };
+  return (
+    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider border ${map[status] || map.pending}`}>
+      {status}
+    </span>
+  );
 }
 
-interface ProtectedWork {
-  id: string;
-  title: string;
-  status: string;
-  matches_found: number;
-  matches: Match[];
+// ── Protection Tag ──
+function ProtectionTag({ label }: { label: string }) {
+  const icons: Record<string, string> = {
+    chromaprint: "🔊", phash: "🎬", c2pa_hash: "🔐",
+    ai_transcript: "📝", metadata: "🏷",
+  };
+  const icon = Object.entries(icons).find(([k]) => label.toLowerCase().includes(k))?.[1] || "✓";
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-white/[0.03] border border-white/[0.06] text-white/40">
+      {icon} {label}
+    </span>
+  );
 }
 
-export default function Dashboard() {
-  const [works, setWorks] = useState<ProtectedWork[]>([]);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  
-  const [dmcaNotice, setDmcaNotice] = useState<string | null>(null);
-  const [isGenerating, setIsGenerating] = useState(false);
+// ── Match Row ──
+function MatchRow({ match, onDMCA, onStatusChange }: {
+  match: Match;
+  onDMCA: (url: string) => void;
+  onStatusChange: (id: string, status: string) => void;
+}) {
+  return (
+    <div className="flex items-start justify-between py-3 border-b border-white/[0.04] last:border-0 gap-3">
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-red-400/70 bg-red-950/40 px-1.5 py-0.5 rounded">
+            {match.platform}
+          </span>
+          {match.confidence_score !== null && (
+            <span className="text-[10px] text-white/20">{match.confidence_score}% confidence</span>
+          )}
+          <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+            match.review_status === "confirmed_infringement" ? "bg-red-950/40 text-red-300" :
+            match.review_status === "false_positive" ? "bg-white/5 text-white/25 line-through" :
+            match.review_status === "authorized_use" ? "bg-green-950/40 text-green-300" :
+            "bg-white/5 text-white/30"
+          }`}>
+            {match.review_status.replace(/_/g, " ")}
+          </span>
+        </div>
+        <a href={match.match_url} target="_blank" rel="noopener noreferrer"
+          className="text-[12px] text-white/50 hover:text-white/80 transition-colors truncate block">
+          {match.match_url}
+        </a>
+      </div>
+      <div className="flex gap-1.5 shrink-0">
+        {match.review_status === "pending" && (
+          <>
+            <button onClick={() => onStatusChange(match.id, "confirmed_infringement")}
+              className="px-2 py-1 rounded text-[10px] bg-red-950/30 border border-red-900/30 text-red-300/70 hover:text-red-200 transition-all"
+              title="Confirm infringement">
+              ✗
+            </button>
+            <button onClick={() => onStatusChange(match.id, "false_positive")}
+              className="px-2 py-1 rounded text-[10px] bg-white/[0.03] border border-white/[0.06] text-white/30 hover:text-white/60 transition-all"
+              title="Mark as false positive">
+              ✓
+            </button>
+          </>
+        )}
+        {match.review_status === "confirmed_infringement" && (
+          <button onClick={() => onDMCA(match.match_url)}
+            className="px-3 py-1.5 rounded text-[11px] font-semibold bg-red-950/40 border border-red-900/40 text-red-300 hover:bg-red-900/40 transition-all">
+            DMCA
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
-  useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/v1/works')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setWorks(data);
-      })
-      .catch(err => console.error("Dashboard fetch error:", err));
-  }, []);
+// ── Work Card ──
+function WorkCard({ work, onRefresh }: { work: Work; onRefresh: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const [matches, setMatches] = useState<Match[]>([]);
+  const [loadingMatches, setLoadingMatches] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [dmcaNotice, setDmcaNotice] = useState<any>(null);
 
-  const toggleExpand = (id: string) => {
-    setExpandedId(expandedId === id ? null : id);
+  const loadMatches = async () => {
+    setLoadingMatches(true);
+    try { setMatches(await getMatches(work.id)); } catch {}
+    setLoadingMatches(false);
   };
 
-  const issueTakedown = async (workId: string, url: string) => {
-    setIsGenerating(true);
+  const handleExpand = () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next) loadMatches();
+  };
+
+  const handleScan = async () => {
+    setScanning(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/works/${workId}/generate-dmca?infringing_url=${encodeURIComponent(url)}`, {
-        method: 'POST'
-      });
-      const data = await res.json();
-      setDmcaNotice(data.notice_text);
-    } catch (err) {
-      alert("Error generating DMCA notice.");
-    }
-    setIsGenerating(false);
+      await triggerScan(work.id);
+      setTimeout(async () => {
+        await loadMatches();
+        onRefresh();
+        setScanning(false);
+      }, 12000);
+    } catch { setScanning(false); }
   };
 
-  // NEW: Function to handle a manual URL input
-  const handleManualTakedown = (workId: string) => {
-    const manualUrl = prompt("Enter the exact URL of the stolen content you found:");
-    if (manualUrl && manualUrl.trim() !== "") {
-      issueTakedown(workId, manualUrl);
-    }
+  const handleDMCA = async (url: string) => {
+    try { setDmcaNotice(await generateDMCA(work.id, url)); } catch {}
   };
 
-  const deleteWork = async (id: string) => {
-    if (!confirm("Are you sure you want to permanently delete this record?")) return;
+  const handleStatusChange = async (matchId: string, status: string) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/works/${id}`, { method: 'DELETE' });
-      if (res.ok) setWorks(works.filter(w => w.id !== id));
-    } catch (err) {
-      console.error("Delete error:", err);
-    }
+      await updateMatchStatus(matchId, status);
+      await loadMatches();
+    } catch {}
   };
+
+  const handleDelete = async () => {
+    if (!confirm("Delete this work and all associated data? This cannot be undone.")) return;
+    try { await deleteWork(work.id); onRefresh(); } catch {}
+  };
+
+  const matchCount = work.matches_found || 0;
 
   return (
-    <main className="min-h-screen bg-gray-50 p-8 text-gray-900">
-      
-      {/* UPGRADED DMCA MODAL */}
-      {dmcaNotice && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full max-h-[90vh] flex flex-col overflow-hidden">
-            <div className="p-6 border-b border-gray-100 flex justify-between items-center bg-white">
-              <h2 className="text-xl font-bold text-red-600">Generated DMCA Notice</h2>
-              <button onClick={() => setDmcaNotice(null)} className="text-gray-400 hover:text-black font-bold">✕</button>
+    <>
+      <div onClick={handleExpand}
+        className="border border-white/[0.06] rounded-xl p-5 bg-white/[0.01] hover:bg-white/[0.02] transition-all cursor-pointer">
+        {/* Header */}
+        <div className="flex justify-between items-start">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2.5 mb-1.5">
+              <span className="text-[13px] font-medium text-white/80 truncate">{work.title}</span>
+              <StatusBadge status={work.processing_status} />
             </div>
-            
-            <div className="p-6 overflow-y-auto flex-1 bg-gray-50">
-              <pre className="whitespace-pre-wrap font-mono text-sm bg-white p-5 rounded-lg border border-gray-200 text-gray-800 shadow-sm">
-                {dmcaNotice}
-              </pre>
+            <div className="text-[11px] text-white/20">
+              {work.media_type === "audio" ? "♫ Audio" : "▶ Video"}
+              {" · "}ID: {work.id.slice(0, 8)}
+              {work.created_at && <> · {new Date(work.created_at).toLocaleDateString()}</>}
+            </div>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            {matchCount > 0 && (
+              <span className="text-[12px] font-bold text-red-400">
+                {matchCount} match{matchCount !== 1 ? "es" : ""}
+              </span>
+            )}
+            <span className={`text-white/20 text-[12px] transition-transform ${expanded ? "rotate-180" : ""}`}>▼</span>
+          </div>
+        </div>
 
-              {/* NEW: Platform Submission Guide */}
-              <div className="mt-6 bg-blue-50/50 p-5 rounded-lg border border-blue-100">
-                <h3 className="font-bold text-blue-900 mb-3 flex items-center gap-2">
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-blue-600" viewBox="0 0 20 20" fill="currentColor"><path d="M2.003 5.884L10 9.882l7.997-3.998A2 2 0 0016 4H4a2 2 0 00-1.997 1.884z" /><path d="M18 8.118l-8 4-8-4V14a2 2 0 002 2h12a2 2 0 002-2V8.118z" /></svg>
-                  Where to send this notice:
-                </h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-blue-800">
-                  <div className="bg-white p-3 rounded shadow-sm border border-blue-50">
-                    <span className="font-bold block mb-1">YouTube</span>
-                    Email: <a href="mailto:copyright@youtube.com" className="text-blue-600 hover:underline">copyright@youtube.com</a><br/>
-                    Or use their <a href="https://support.google.com/youtube/answer/2807622" target="_blank" className="text-blue-600 hover:underline">Copyright Webform →</a>
-                  </div>
-                  <div className="bg-white p-3 rounded shadow-sm border border-blue-50">
-                    <span className="font-bold block mb-1">TikTok</span>
-                    Email: <a href="mailto:copyright@tiktok.com" className="text-blue-600 hover:underline">copyright@tiktok.com</a><br/>
-                    Or use their <a href="https://www.tiktok.com/legal/report/Copyright" target="_blank" className="text-blue-600 hover:underline">Reporting Form →</a>
-                  </div>
-                  <div className="bg-white p-3 rounded shadow-sm border border-blue-50">
-                    <span className="font-bold block mb-1">Instagram & Facebook</span>
-                    Email: <a href="mailto:ip@instagram.com" className="text-blue-600 hover:underline">ip@instagram.com</a><br/>
-                    Or use their <a href="https://help.instagram.com/contact/552695131608132" target="_blank" className="text-blue-600 hover:underline">IP Webform →</a>
-                  </div>
-                  <div className="bg-white p-3 rounded shadow-sm border border-blue-50">
-                    <span className="font-bold block mb-1">X (Twitter)</span>
-                    Email: <a href="mailto:copyright@twitter.com" className="text-blue-600 hover:underline">copyright@twitter.com</a><br/>
-                    Or use their <a href="https://help.twitter.com/en/forms/ipi/dmca" target="_blank" className="text-blue-600 hover:underline">DMCA Form →</a>
-                  </div>
-                </div>
+        {/* Expanded detail */}
+        {expanded && (
+          <div className="mt-5 pt-5 border-t border-white/[0.04]" onClick={(e) => e.stopPropagation()}>
+            {/* Transcript preview */}
+            {work.transcript && (
+              <div className="mb-4">
+                <div className="text-[10px] text-white/20 uppercase tracking-widest mb-2">Transcript</div>
+                <p className="text-[11px] text-white/30 leading-relaxed bg-white/[0.02] rounded p-3 border border-white/[0.04]">
+                  {work.transcript.slice(0, 200)}{work.transcript.length > 200 ? "..." : ""}
+                </p>
               </div>
+            )}
+
+            {/* Hash */}
+            {work.original_hash && (
+              <div className="mb-4">
+                <div className="text-[10px] text-white/20 uppercase tracking-widest mb-1.5">SHA-256</div>
+                <code className="text-[10px] text-white/25 font-mono break-all">{work.original_hash}</code>
+              </div>
+            )}
+
+            {/* Matches */}
+            {matches.length > 0 && (
+              <div className="mb-4">
+                <div className="text-[10px] text-white/20 uppercase tracking-widest mb-2">
+                  Matches ({matches.length})
+                </div>
+                {loadingMatches ? (
+                  <div className="text-[11px] text-white/20 py-2">Loading...</div>
+                ) : (
+                  matches.map((m) => (
+                    <MatchRow key={m.id} match={m} onDMCA={handleDMCA} onStatusChange={handleStatusChange} />
+                  ))
+                )}
+              </div>
+            )}
+            {matches.length === 0 && !loadingMatches && matchCount === 0 && work.processing_status === "protected" && (
+              <div className="mb-4 text-[11px] text-white/15">No matches found yet.</div>
+            )}
+
+            {/* Actions */}
+            {work.processing_status === "protected" && (
+              <div className="flex flex-wrap gap-2 mt-2">
+                <a href={certificateUrl(work.id)} target="_blank" rel="noopener noreferrer">
+                  <button className="px-3 py-2 rounded-lg text-[11px] font-medium bg-white/[0.03] border border-white/[0.08] text-white/40 hover:text-white/70 hover:bg-white/[0.06] transition-all">
+                    📄 Certificate
+                  </button>
+                </a>
+                <button onClick={handleScan} disabled={scanning}
+                  className="px-3 py-2 rounded-lg text-[11px] font-medium bg-white/[0.03] border border-white/[0.08] text-white/40 hover:text-white/70 hover:bg-white/[0.06] transition-all disabled:opacity-30">
+                  {scanning ? "Scanning..." : "🔍 Re-scan"}
+                </button>
+                <button onClick={handleDelete}
+                  className="px-3 py-2 rounded-lg text-[11px] font-medium text-red-400/40 hover:text-red-400 hover:bg-red-950/30 transition-all ml-auto">
+                  Delete
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* DMCA Modal */}
+      {dmcaNotice && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setDmcaNotice(null)}>
+          <div className="bg-[#0a0a0f] border border-white/[0.08] rounded-xl w-full max-w-xl max-h-[80vh] overflow-y-auto p-6"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-[14px] font-bold text-white/90">DMCA Takedown Notice</h3>
+              <button onClick={() => setDmcaNotice(null)} className="text-white/20 hover:text-white/50 text-lg">×</button>
             </div>
 
-            <div className="p-4 border-t border-gray-100 bg-white flex justify-end gap-3 shrink-0">
-              <button onClick={() => setDmcaNotice(null)} className="px-4 py-2 text-gray-600 font-medium hover:bg-gray-100 rounded-lg transition-colors">Cancel</button>
-              <button 
-                onClick={() => {navigator.clipboard.writeText(dmcaNotice); alert("Copied to clipboard!");}} 
-                className="px-6 py-2 bg-red-600 text-white font-bold rounded-lg hover:bg-red-700 shadow-sm transition-colors"
-              >
-                Copy to Clipboard
+            <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-900/30 mb-4">
+              <p className="text-[11px] text-amber-300/80 leading-relaxed">{dmcaNotice.fair_use_warning}</p>
+            </div>
+
+            <pre className="text-[11px] text-white/50 whitespace-pre-wrap font-mono bg-white/[0.02] rounded-lg p-4 border border-white/[0.04] mb-4 leading-relaxed">
+              {dmcaNotice.notice_text}
+            </pre>
+
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => navigator.clipboard.writeText(dmcaNotice.notice_text)}
+                className="px-4 py-2 rounded-lg text-[12px] font-semibold bg-white/10 text-white/80 hover:bg-white/15 transition-all">
+                Copy Notice
               </button>
+              {dmcaNotice.submission_links && Object.entries(dmcaNotice.submission_links).map(([platform, url]) => (
+                <a key={platform} href={url as string} target="_blank" rel="noopener noreferrer">
+                  <button className="px-3 py-2 rounded-lg text-[11px] font-medium bg-white/[0.03] border border-white/[0.06] text-white/30 hover:text-white/60 transition-all capitalize">
+                    Submit → {platform}
+                  </button>
+                </a>
+              ))}
             </div>
           </div>
         </div>
       )}
+    </>
+  );
+}
 
-      <div className="max-w-4xl mx-auto">
-        <h1 className="text-3xl font-bold mb-8 text-center">Monitoring Dashboard</h1>
-        
-        <div className="bg-amber-50 border-l-4 border-amber-500 p-4 mb-8 rounded-r-lg shadow-sm">
-          <div className="flex">
-            <div className="flex-shrink-0"><span className="text-amber-500 font-bold">⚠️ Notice:</span></div>
-            <div className="ml-3">
-              <p className="text-sm text-amber-700 font-medium">
-                We do not store your media files. Your protected file will be <strong>permanently deleted from our servers immediately after you download it</strong>. 
-              </p>
-            </div>
+// ── Main Dashboard ──
+export default function DashboardPage() {
+  const router = useRouter();
+  const [authorized, setAuthorized] = useState(false);
+  const [works, setWorks] = useState<Work[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) router.push("/login");
+      else setAuthorized(true);
+    });
+  }, [router]);
+
+  const fetchWorks = useCallback(async () => {
+    try { setWorks(await listWorks()); } catch {}
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (!authorized) return;
+    fetchWorks();
+    const interval = setInterval(fetchWorks, 8000);
+    return () => clearInterval(interval);
+  }, [authorized, fetchWorks]);
+
+  const totalMatches = works.reduce((s, w) => s + (w.matches_found || 0), 0);
+  const protectedCount = works.filter((w) => w.processing_status === "protected").length;
+
+  if (!authorized) {
+    return <div className="min-h-screen flex items-center justify-center bg-black text-white/30 text-sm">Verifying session...</div>;
+  }
+
+  return (
+    <main className="min-h-screen bg-black text-white">
+      <div className="max-w-2xl mx-auto px-6 py-10">
+        <div className="flex justify-between items-end mb-8">
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight mb-1">Dashboard</h1>
+            <p className="text-[12px] text-white/25">Your protected works and detected matches</p>
           </div>
+          <Link href="/upload">
+            <button className="px-4 py-2 rounded-lg text-[12px] font-semibold bg-red-600 text-white hover:bg-red-500 transition-all">
+              + Upload
+            </button>
+          </Link>
         </div>
 
-        <div className="grid gap-4">
-          {works.map((work) => (
-            <div key={work.id} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden relative group">
-              
-              <button onClick={() => deleteWork(work.id)} className="absolute top-4 right-4 text-gray-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100" title="Delete Record">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
-              </button>
-
-              <div className="p-6 pr-12 flex justify-between items-center">
-                <div>
-                  <h3 className="font-semibold text-lg">{work.title}</h3>
-                  <p className="text-xs text-gray-400 font-mono mt-1">ID: {work.id}</p>
-                </div>
-                
-                <div className="flex items-center gap-3">
-                  <span className="px-3 py-1 bg-blue-50 text-blue-600 rounded-full text-xs font-bold uppercase mr-2">{work.status}</span>
-                  <div className="text-right px-3 border-r border-gray-100">
-                    <div className="text-2xl font-bold text-red-500">{work.matches_found}</div>
-                    <div className="text-[10px] uppercase text-gray-400 font-bold leading-none">Matches</div>
-                  </div>
-                  
-                  {/* NEW: Manual Takedown Button */}
-                  <button 
-                    onClick={() => handleManualTakedown(work.id)}
-                    className="bg-red-50 text-red-600 px-3 py-2 rounded-lg text-sm hover:bg-red-100 transition-colors font-bold border border-red-100"
-                    title="Found a stolen copy yourself? Generate a notice here."
-                  >
-                    + Manual DMCA
-                  </button>
-
-                  <button onClick={() => toggleExpand(work.id)} className="bg-gray-800 text-white px-4 py-2 rounded-lg text-sm hover:bg-black transition-colors">
-                    {expandedId === work.id ? "Hide Links" : "View Links"}
-                  </button>
-                  <a href={`http://127.0.0.1:8000/api/v1/works/${work.id}/download`} download className="bg-green-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-green-700 transition-colors font-bold shadow-sm">
-                    ↓ Download
-                  </a>
-                </div>
-              </div>
-
-              {expandedId === work.id && (
-                <div className="bg-gray-50 border-t border-gray-100 p-6">
-                  <h4 className="text-sm font-bold text-gray-700 mb-3 uppercase tracking-wider">Discovered Matches</h4>
-                  <div className="grid gap-3">
-                    {work.matches && work.matches.length > 0 ? work.matches.map((match, idx) => (
-                      <div key={idx} className="bg-white p-3 rounded border border-gray-200 flex justify-between items-center">
-                        <div className="flex items-center gap-3">
-                          <span className="font-bold text-sm text-gray-800 w-20">{match.platform}</span>
-                          <a href={match.url} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline text-sm truncate max-w-xs">{match.url}</a>
-                        </div>
-                        <button onClick={() => issueTakedown(work.id, match.url)} className="text-xs bg-red-100 text-red-600 hover:bg-red-200 px-3 py-1.5 rounded font-semibold transition-colors disabled:opacity-50" disabled={isGenerating}>
-                          {isGenerating ? "Generating..." : "Issue Takedown"}
-                        </button>
-                      </div>
-                    )) : (
-                      <p className="text-sm text-gray-500 italic">No automated matches found yet. Use the "+ Manual DMCA" button if you found one yourself!</p>
-                    )}
-                  </div>
-                </div>
-              )}
+        {/* Stats */}
+        <div className="grid grid-cols-3 gap-3 mb-8">
+          {[
+            { label: "Total Works", value: works.length, color: "text-white/60" },
+            { label: "Protected", value: protectedCount, color: "text-green-400" },
+            { label: "Matches", value: totalMatches, color: totalMatches > 0 ? "text-red-400" : "text-white/20" },
+          ].map((s) => (
+            <div key={s.label} className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.05]">
+              <div className="text-[10px] text-white/20 uppercase tracking-widest mb-1.5">{s.label}</div>
+              <div className={`text-2xl font-bold ${s.color}`}>{s.value}</div>
             </div>
           ))}
         </div>
+
+        {/* Works */}
+        {loading ? (
+          <div className="text-center py-20 text-white/20 text-sm">Loading...</div>
+        ) : works.length === 0 ? (
+          <div className="text-center py-20">
+            <div className="text-white/10 text-4xl mb-4">↑</div>
+            <div className="text-white/25 text-sm mb-2">No works yet</div>
+            <Link href="/upload" className="text-[12px] text-red-400/60 hover:text-red-400 transition-colors">
+              Upload your first file →
+            </Link>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {works.map((w) => <WorkCard key={w.id} work={w} onRefresh={fetchWorks} />)}
+          </div>
+        )}
       </div>
     </main>
   );

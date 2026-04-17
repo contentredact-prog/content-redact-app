@@ -10,8 +10,7 @@ export default function Navbar() {
   const router = useRouter();
 
   useEffect(() => {
-    // FIXED: Added ': any' to silence the strict type warning here
-    supabase.auth.getSession().then(({ data: { session } }: any) => setSession(session));
+    supabase.auth.getSession().then(({ data: { session } }) => setSession(session));
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event: any, session: any) => setSession(session)
