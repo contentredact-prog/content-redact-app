@@ -1,6 +1,5 @@
 import { supabase } from "./supabase";
 
-// Backend API for processing (upload, scan, DMCA)
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 // ── Types ──
@@ -11,12 +10,13 @@ export interface Work {
   media_type: "audio" | "video";
   owner_name: string;
   processing_status: "pending" | "processing" | "protected" | "failed";
+  processing_stage?: "fingerprinted" | "transcribing" | "scanning" | "monitoring" | "failed";
   original_hash?: string;
   transcript?: string;
   certificate_url?: string;
   protected_at?: string;
   created_at: string;
-  // Joined/computed
+  storage_path?: string;
   fingerprints?: Fingerprint[];
   matches?: Match[];
   matches_found?: number;
@@ -41,7 +41,14 @@ export interface Match {
   created_at: string;
 }
 
-// ── Supabase reads (RLS-protected, user sees only their own data) ──
+export interface UploadResult {
+  work_id: string;
+  status: string;
+  message: string;
+  download_url: string | null;
+}
+
+// ── Supabase reads (RLS-protected) ──
 
 export async function listWorks(): Promise<Work[]> {
   const { data, error } = await supabase
@@ -99,7 +106,6 @@ export async function updateMatchStatus(matchId: string, status: string): Promis
 }
 
 export async function deleteWork(workId: string): Promise<void> {
-  // Cascading deletes handled by DB foreign keys
   const { error } = await supabase
     .from("protected_works")
     .delete()
@@ -108,23 +114,22 @@ export async function deleteWork(workId: string): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
-// ── Backend API calls (for processing that needs server-side tools) ──
+// ── Backend API calls ──
 
-export async function uploadFile(
-  file: File,
-  owner: string
-): Promise<{ work_id: string; status: string }> {
-  // Get current session token to authenticate with backend
+async function getAuthHeaders(): Promise<Record<string, string>> {
   const { data: { session } } = await supabase.auth.getSession();
-
-  const form = new FormData();
-  form.append("file", file);
-  form.append("owner", owner);
-
   const headers: Record<string, string> = {};
   if (session?.access_token) {
     headers["Authorization"] = `Bearer ${session.access_token}`;
   }
+  return headers;
+}
+
+export async function uploadFile(file: File, owner: string): Promise<UploadResult> {
+  const headers = await getAuthHeaders();
+  const form = new FormData();
+  form.append("file", file);
+  form.append("owner", owner);
 
   const res = await fetch(`${API_BASE}/api/v1/works/protect`, {
     method: "POST",
@@ -139,14 +144,24 @@ export async function uploadFile(
   return res.json();
 }
 
-export async function triggerScan(workId: string): Promise<void> {
-  const { data: { session } } = await supabase.auth.getSession();
+export async function getDownloadLink(workId: string): Promise<{ download_url: string; expires_in_seconds: number }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_BASE}/api/v1/works/${workId}/download-link`, { headers });
 
+  if (res.status === 410) {
+    throw new Error("File has expired. Only fingerprints are retained after 48 hours.");
+  }
+  if (!res.ok) {
+    throw new Error("Failed to get download link");
+  }
+  return res.json();
+}
+
+export async function triggerScan(workId: string): Promise<void> {
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_BASE}/api/v1/works/${workId}/scan`, {
     method: "POST",
-    headers: session?.access_token
-      ? { Authorization: `Bearer ${session.access_token}` }
-      : {},
+    headers,
   });
 
   if (!res.ok) {
@@ -155,20 +170,11 @@ export async function triggerScan(workId: string): Promise<void> {
   }
 }
 
-export async function generateDMCA(
-  workId: string,
-  infringingUrl: string
-): Promise<any> {
-  const { data: { session } } = await supabase.auth.getSession();
-
+export async function generateDMCA(workId: string, infringingUrl: string): Promise<any> {
+  const headers = await getAuthHeaders();
   const res = await fetch(
     `${API_BASE}/api/v1/works/${workId}/generate-dmca?infringing_url=${encodeURIComponent(infringingUrl)}`,
-    {
-      method: "POST",
-      headers: session?.access_token
-        ? { Authorization: `Bearer ${session.access_token}` }
-        : {},
-    }
+    { method: "POST", headers }
   );
 
   if (!res.ok) throw new Error("DMCA generation failed");

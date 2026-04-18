@@ -17,6 +17,7 @@ export default function UploadPage() {
   const [state, setState] = useState<UploadState>("idle");
   const [workId, setWorkId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -41,6 +42,7 @@ export default function UploadPage() {
     setFile(f);
     setState("idle");
     setWorkId(null);
+    setDownloadUrl(null);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -59,18 +61,17 @@ export default function UploadPage() {
       const { data: { session } } = await supabase.auth.getSession();
       const owner = session?.user?.email || "Unknown";
 
-      // 1. Send to your live Render backend
       const result = await uploadFile(file, owner);
       setWorkId(result.work_id);
 
-      // 2. THE FAST PATH CHECK! 
-      // If the new async backend instantly returns "protected", we are done!
+      // Fast path: backend returns "protected" instantly with download link
       if (result.status === "protected") {
+        if (result.download_url) setDownloadUrl(result.download_url);
         setState("done");
         return;
       }
 
-      // 3. Fallback (Only runs if status is still 'processing')
+      // Fallback: poll for status (only if backend returns "processing")
       setState("processing");
       let attempts = 0;
       const poll = setInterval(async () => {
@@ -97,6 +98,13 @@ export default function UploadPage() {
     }
   };
 
+  const handleDownload = () => {
+    // Open in new tab — cross-origin signed URLs don't support the download attribute
+    if (downloadUrl) {
+      window.open(downloadUrl, "_blank");
+    }
+  };
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -107,10 +115,12 @@ export default function UploadPage() {
   }
 
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center p-8 bg-black text-white">
+    <main className="min-h-screen flex flex-col items-center justify-center p-4 sm:p-8 bg-black text-white">
       <div className="w-full max-w-lg">
-        <h1 className="text-3xl font-bold mb-2 tracking-tight">Protect Your Content</h1>
-        <p className="text-sm text-white/30 mb-8">Upload audio or video. We fingerprint it, transcribe it, and scan for theft.</p>
+        <h1 className="text-2xl sm:text-3xl font-bold mb-2 tracking-tight">Protect Your Content</h1>
+        <p className="text-sm text-white/30 mb-6 sm:mb-8">
+          Upload audio or video. We fingerprint it, stamp your metadata, and scan for theft.
+        </p>
 
         {/* Drop zone */}
         <div
@@ -119,7 +129,7 @@ export default function UploadPage() {
           onDrop={handleDrop}
           onClick={() => fileInputRef.current?.click()}
           className={`
-            relative border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-all duration-200
+            relative border-2 border-dashed rounded-xl p-8 sm:p-12 text-center cursor-pointer transition-all duration-200
             ${dragOver ? "border-red-500/60 bg-red-950/20" : file ? "border-white/10 bg-white/[0.02]" : "border-white/[0.08] bg-white/[0.01] hover:border-white/15 hover:bg-white/[0.03]"}
           `}
         >
@@ -129,9 +139,13 @@ export default function UploadPage() {
           {file ? (
             <div>
               <div className="text-[13px] font-medium text-white/80 mb-1 truncate">{file.name}</div>
-              <div className="text-[11px] text-white/30">{file.type.includes("video") ? "Video" : "Audio"} &middot; {formatSize(file.size)}</div>
-              <button onClick={(e) => { e.stopPropagation(); setFile(null); setState("idle"); }}
-                className="mt-3 text-[11px] text-white/20 hover:text-red-400 transition-colors">Remove</button>
+              <div className="text-[11px] text-white/30">
+                {file.type.includes("video") ? "Video" : "Audio"} &middot; {formatSize(file.size)}
+              </div>
+              <button onClick={(e) => { e.stopPropagation(); setFile(null); setState("idle"); setDownloadUrl(null); }}
+                className="mt-3 text-[11px] text-white/20 hover:text-red-400 transition-colors">
+                Remove
+              </button>
             </div>
           ) : (
             <div>
@@ -142,10 +156,12 @@ export default function UploadPage() {
           )}
         </div>
 
+        {/* Error */}
         {error && (
           <div className="mt-4 p-3 rounded-lg bg-red-950/40 border border-red-900/40 text-[13px] text-red-300">{error}</div>
         )}
 
+        {/* Upload button */}
         {file && state === "idle" && (
           <button onClick={handleUpload}
             className="mt-6 w-full bg-red-600 text-white py-3.5 rounded-lg font-semibold text-[14px] hover:bg-red-500 transition-all shadow-[0_0_20px_rgba(220,38,38,0.2)]">
@@ -153,36 +169,66 @@ export default function UploadPage() {
           </button>
         )}
 
+        {/* Uploading / Processing spinner */}
         {(state === "uploading" || state === "processing") && (
-          <div className="mt-6 p-5 rounded-xl bg-white/[0.02] border border-white/[0.06]">
+          <div className="mt-6 p-4 sm:p-5 rounded-xl bg-white/[0.02] border border-white/[0.06]">
             <div className="flex items-center gap-3">
-              <div className="w-5 h-5 border-2 border-white/20 border-t-red-500 rounded-full animate-spin" />
+              <div className="w-5 h-5 border-2 border-white/20 border-t-red-500 rounded-full animate-spin shrink-0" />
               <div>
                 <div className="text-[13px] font-medium text-white/80">
                   {state === "uploading" ? "Uploading..." : "Processing..."}
                 </div>
                 <div className="text-[11px] text-white/30 mt-0.5">
-                  {state === "uploading" ? "Sending file to server" : "Hashing → Fingerprinting → Transcribing → Scanning"}
+                  {state === "uploading"
+                    ? "Sending file to server"
+                    : "Hashing → Fingerprinting → Stamping metadata"
+                  }
                 </div>
               </div>
             </div>
           </div>
         )}
 
+        {/* Success */}
         {state === "done" && (
-          <div className="mt-6 p-5 rounded-xl bg-green-950/30 border border-green-900/30">
+          <div className="mt-6 p-4 sm:p-5 rounded-xl bg-green-950/30 border border-green-900/30">
             <div className="text-[13px] font-semibold text-green-400 mb-1">✓ Protection Complete</div>
-            <div className="text-[11px] text-green-300/50 mb-4">Your content has been fingerprinted, transcribed, and scanned.</div>
-            <Link href="/dashboard">
-              <button className="w-full py-2.5 rounded-lg bg-white/5 border border-white/10 text-[13px] font-medium text-white/70 hover:bg-white/10 hover:text-white transition-all">
-                View Dashboard
-              </button>
-            </Link>
+            <div className="text-[11px] text-green-300/50 mb-4">
+              Your content is fingerprinted and metadata-tagged. Background scan is in progress.
+            </div>
+
+            <div className="flex flex-col gap-2.5">
+              {/* Download stamped file */}
+              {downloadUrl && (
+                <button
+                  onClick={handleDownload}
+                  className="w-full py-2.5 rounded-lg bg-red-600/20 border border-red-500/30 text-[13px] font-medium text-red-400 hover:bg-red-600/40 transition-all cursor-pointer"
+                >
+                  ↓ Download Protected File
+                </button>
+              )}
+
+              {/* Dashboard */}
+              <Link href="/dashboard" className="w-full">
+                <button className="w-full py-2.5 rounded-lg bg-white/5 border border-white/10 text-[13px] font-medium text-white/70 hover:bg-white/10 hover:text-white transition-all">
+                  View Dashboard
+                </button>
+              </Link>
+            </div>
+
+            {downloadUrl && (
+              <div className="mt-3 text-[10px] text-white/15 text-center">
+                Download link expires in 1 hour. File is deleted after 48 hours.
+              </div>
+            )}
           </div>
         )}
 
-        <div className="mt-10 text-center">
-          <Link href="/dashboard" className="text-[12px] text-white/20 hover:text-white/40 transition-colors">Go to Dashboard →</Link>
+        {/* Dashboard link */}
+        <div className="mt-8 sm:mt-10 text-center">
+          <Link href="/dashboard" className="text-[12px] text-white/20 hover:text-white/40 transition-colors">
+            Go to Dashboard →
+          </Link>
         </div>
       </div>
     </main>
