@@ -43,7 +43,8 @@ from supabase import create_client, Client
 # CONFIG
 # ============================================================
 BACKEND_DIR = Path(__file__).parent
-FPCALC_BIN = str(BACKEND_DIR / "fpcalc.exe") if platform.system() == "Windows" else "fpcalc"
+FPCALC_BIN = str(BACKEND_DIR / "fpcalc.exe") if platform.system() == "Windows" else str(BACKEND_DIR / "fpcalc")
+FFMPEG_BIN = "ffmpeg" if platform.system() == "Windows" else str(BACKEND_DIR / "ffmpeg")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://dkppcuotnphzjcmncnjg.supabase.co")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -150,11 +151,16 @@ def db_get_user_by_email(email: str) -> Optional[dict]:
 # ============================================================
 # SUPABASE STORAGE HELPERS
 # ============================================================
-def upload_to_storage(local_path: str, storage_path: str) -> bool:
+def upload_to_storage(local_path: str, storage_path: str, content_type: str = "application/octet-stream") -> bool:
+    """Upload file to Supabase Storage with explicit MIME type."""
     try:
         with open(local_path, "rb") as f:
-            sb.storage.from_(STORAGE_BUCKET).upload(storage_path, f)
-        print(f"[Storage] Uploaded: {storage_path}")
+            sb.storage.from_(STORAGE_BUCKET).upload(
+                storage_path,
+                f,
+                file_options={"content-type": content_type}
+            )
+        print(f"[Storage] Uploaded: {storage_path} ({content_type})")
         return True
     except Exception as e:
         print(f"[Storage] Upload failed: {e}")
@@ -225,7 +231,7 @@ def get_video_fingerprint(filepath: str) -> Optional[str]:
     try:
         thumb = filepath + ".thumb.jpg"
         subprocess.run(
-            ["ffmpeg", "-y", "-i", filepath, "-ss", "5", "-frames:v", "1", thumb],
+            [FFMPEG_BIN, "-y", "-i", filepath, "-ss", "5", "-frames:v", "1", thumb],
             capture_output=True, timeout=30
         )
         if os.path.exists(thumb):
@@ -262,7 +268,7 @@ def embed_video_metadata(input_path: str, output_path: str, work_id: str, owner:
     """Stamp video with copyright metadata via ffmpeg. Output to a separate file."""
     try:
         result = subprocess.run([
-            "ffmpeg", "-y", "-i", input_path,
+            FFMPEG_BIN, "-y", "-i", input_path,
             "-metadata", f"copyright=\u00a9 {owner}",
             "-metadata", f"comment=ContentRedact-WorkID:{work_id}",
             "-codec", "copy", output_path
@@ -574,7 +580,7 @@ async def protect_new_work(
         user_id = user["id"] if user else "anonymous"
         storage_path = f"{user_id}/{work_id}{file_ext}"
 
-        if not upload_to_storage(temp_path, storage_path):
+        if not upload_to_storage(temp_path, storage_path, file.content_type):
             raise Exception("Failed to upload to storage")
 
         # 5. Generate signed download URL
